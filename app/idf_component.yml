@@ -1,20 +1,9 @@
 # Component manifest for the "Local" device app.
-#
-# This app has no third-party managed dependencies. Its one dependency —
-# taskmaster_core (the stable app API) — is satisfied by the firmware build it's
-# pulled into: in a TaskMaster project, core is a LOCAL component, and local
-# components win over fetched ones, so we declare it as a plain CMake REQUIRES
-# (see CMakeLists.txt) rather than a git dependency here. That avoids fetching a
-# second copy of core during the build.
-#
-# `version` is this app's own version (independent of core — that's the whole
-# point of the repo split). `targets` pins the silicon.
+# taskmaster_core is provided locally by the firmware build (plain CMake REQUIRES).
+# cJSON isn't bundled in IDF v6, so pull it from the component registry.
 version: "0.1.0"
 description: "TaskMaster-C3 'Local' task source app"
 targets:
   - esp32c3
-
-# (If this app ever needs a real managed dependency, it would go here, e.g.:
-# dependencies:
-#   some/managed-component: "^1.0"
-# Core is intentionally NOT listed — it's provided locally by the build.)
+dependencies:
+  espressif/cjson: "^1.7"
