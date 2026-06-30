@@ -30,14 +30,18 @@ static const char *TAG = "app.local";
 #define LOCAL_BODY_MAX    8192
 #define LOCAL_HTTP_TMO_MS 8000
 
-/* Task Manager hints: rotate scrolls, Select completes, click syncs. */
-static const control_hints_t LOCAL_HINTS = { .rotate = "<>", .click = "SYN", .select = "DON" };
+/* Task Manager hints: rotate scrolls, Select completes, click syncs.
+ * Offline: the click hint flips SYN→OFF since sync is unavailable (§8.5 step 12). */
+static const control_hints_t LOCAL_HINTS         = { .rotate = "<>", .click = "SYN", .select = "DON" };
+static const control_hints_t LOCAL_HINTS_OFFLINE = { .rotate = "<>", .click = "OFF", .select = "DON" };
 
 static app_store_t  s_store;
 static char         s_url[LOCAL_URL_MAX];
 static task_view_t  s_view;
+static task_queue_t s_queue;     /* completes done offline, replayed on reconnect */
 static bool         s_syncing;
 static bool         s_error;
+static bool         s_online;    /* last-seen connectivity — to fire replay on reconnect */
 static async_job_t *s_job;
 
 /* App config (§9.4): the LAN server base URL, e.g. http://192.168.1.50:8080 */
@@ -186,10 +190,64 @@ static void complete_done(void *ctx, bool ok)
     do_sync();                 /* refresh from the server (confirms the removal) */
 }
 
+/* Drop the selected task from the view (optimistic completion). */
+static void view_remove(int sel)
+{
+    for (int i = sel; i < s_view.count - 1; i++) {
+        s_view.items[i] = s_view.items[i + 1];
+    }
+    task_view_set_count(&s_view, s_view.count - 1);
+}
+
+/* ── offline write queue: replay queued completes on reconnect (§8.5 step 12) ── */
+static void drain_queue(void);
+
+static void replay_done(void *ctx, bool ok)
+{
+    (void)ctx;
+    s_syncing = false;
+    s_job = NULL;
+    if (!ok) {
+        return;   /* leave it queued; retry on the next reconnect (avoids hammering) */
+    }
+    task_queue_remove(&s_queue, 0);
+    task_queue_save(&s_store, &s_queue);
+    if (s_queue.n > 0) {
+        drain_queue();   /* next queued complete */
+    } else {
+        do_sync();       /* queue drained → refresh the list from the server */
+    }
+}
+
+/* Submit the head of the queue as a complete job; chains via replay_done. */
+static void drain_queue(void)
+{
+    if (s_queue.n == 0 || !net_is_online() || s_syncing) {
+        return;
+    }
+    post_ctx_t p = {0};
+    strlcpy(p.url, s_url, sizeof(p.url));
+    strlcpy(p.id, s_queue.ids[0], sizeof(p.id));
+    s_job = async_job_submit(complete_work, replay_done, &p, sizeof(p));
+    if (s_job) {
+        s_syncing = true;
+    }
+}
+
 static void do_complete(void)
 {
     int sel = task_view_sel(&s_view);
     if (sel < 0 || sel >= s_view.count || s_syncing) {
+        return;
+    }
+    if (!net_is_online()) {
+        /* Offline: queue the complete + remove optimistically; persist both so the
+         * completion survives a reboot and replays on reconnect (§8.5 step 12). */
+        if (task_queue_push(&s_queue, s_view.items[sel].id)) {
+            task_queue_save(&s_store, &s_queue);
+            view_remove(sel);
+            task_cache_save(&s_store, &s_view);   /* keep cache consistent with the view */
+        }
         return;
     }
     post_ctx_t p = {0};
@@ -198,11 +256,7 @@ static void do_complete(void)
     s_job = async_job_submit(complete_work, complete_done, &p, sizeof(p));
     if (s_job) {
         s_syncing = true;
-        /* Optimistic: drop the row now for a snappy ✓; the re-sync confirms. */
-        for (int i = sel; i < s_view.count - 1; i++) {
-            s_view.items[i] = s_view.items[i + 1];
-        }
-        task_view_set_count(&s_view, s_view.count - 1);
+        view_remove(sel);   /* optimistic: drop the row now for a snappy ✓ */
     }
 }
 
@@ -215,7 +269,14 @@ static void local_init(void)
     s_job = NULL;
     app_store_open(&s_store, LOCAL_NS);
     app_store_get_str(&s_store, "url", s_url, sizeof(s_url), "");
-    do_sync();
+    task_cache_load(&s_store, &s_view);    /* show tasks instantly, even offline */
+    task_queue_load(&s_store, &s_queue);
+    s_online = net_is_online();
+    if (s_online && s_queue.n > 0) {
+        drain_queue();   /* replay pending completes, then it re-syncs */
+    } else {
+        do_sync();       /* no-op when offline */
+    }
 }
 
 static void local_on_event(uint8_t ev)
@@ -232,11 +293,25 @@ static void local_on_event(uint8_t ev)
 static void local_render(void)
 {
     lv_obj_clean(ui_frame_content());
-    ui_frame_set_hints(&LOCAL_HINTS);
+
+    /* The UI task re-runs render() on every connectivity change, so this is where we
+     * notice a reconnect and replay queued completes / resume syncing (§8.5 step 12). */
+    bool online = net_is_online();
+    if (online && !s_online) {
+        if (s_queue.n > 0) drain_queue();
+        else               do_sync();
+    }
+    s_online = online;
+
+    ui_frame_set_hints(online ? &LOCAL_HINTS : &LOCAL_HINTS_OFFLINE);
 
     if (s_url[0] == '\0') {
         ui_text_row(0, "Set URL in setup");
         ui_text_row(1, "(Settings/Wi-Fi)");
+        return;
+    }
+    if (!online) {
+        task_view_render_offline(&s_view, s_queue.n);   /* cached list + OFFLINE banner */
         return;
     }
     if (s_syncing && s_view.count == 0) {
@@ -258,6 +333,7 @@ static void local_exit(void)
         async_job_cancel(s_job);
         s_job = NULL;
     }
+    task_cache_save(&s_store, &s_view);   /* persist for the next (maybe offline) open */
     app_store_close(&s_store);
 }
 
