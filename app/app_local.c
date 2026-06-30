@@ -1,55 +1,175 @@
 /*
- * app_local.c — the "Local" device app for TaskMaster-C3.
+ * app_local.c — the "Local" device app for TaskMaster-C3 (LAN contract source).
  *
- * Firmware half of the yapplocal source product: a self-registering app pulled
- * into a build via the manifest. Depends only on the stable core app API
- * (core ⟂ userspace).
- *
- * Step 9: renders a task list (priority + nesting) from STATIC canned tasks via
- * the core ui_list. Step 10 replaces the canned data with a real fetch over the
- * LAN contract (async_job → GET /tasks → parse into the task model).
+ * Fetches tasks from a LAN server that speaks the device contract (PLAN §8.1):
+ *   GET <url>/tasks → { "tasks":[ {id,parent_id,title,due,priority,done}, ... ] }
+ * The fetch runs through core's async_job (off the UI task, §6A.2) with
+ * cooperative cancel; the result is parsed (cJSON) into the task model and
+ * rendered via the core ui_list (tasks.[ch]). The server URL is app-declared
+ * config (§9.4), pasted in the setup form — never hardcoded, never in core.
  */
 #include "app.h"
 #include "input.h"
 #include "ui_frame.h"
+#include "net_status.h"
+#include "app_store.h"
+#include "app_config.h"
+#include "async_job.h"
 #include "tasks.h"
 
+#include "esp_http_client.h"
+#include "cJSON.h"
+#include "esp_log.h"
 #include <string.h>
+#include <stdlib.h>
 
-/* Task Manager hints: rotate scrolls, Select completes, click opens the menu. */
-static const control_hints_t LOCAL_HINTS = { .rotate = "<>", .click = "MNU", .select = "DON" };
+static const char *TAG = "app.local";
 
-static task_view_t s_view;
+#define LOCAL_NS          "local"
+#define LOCAL_URL_MAX     128
+#define LOCAL_BODY_MAX    8192
+#define LOCAL_HTTP_TMO_MS 8000
 
-/* Seed canned tasks (mirror the yapplocal stub) until the fetch lands (step 10). */
-static void seed_task(int i, const char *id, const char *parent, const char *title,
-                      const char *due, uint8_t prio)
+/* Task Manager hints: rotate scrolls, Select completes, click syncs. */
+static const control_hints_t LOCAL_HINTS = { .rotate = "<>", .click = "SYN", .select = "DON" };
+
+static app_store_t  s_store;
+static char         s_url[LOCAL_URL_MAX];
+static task_view_t  s_view;
+static bool         s_syncing;
+static bool         s_error;
+static async_job_t *s_job;
+
+/* App config (§9.4): the LAN server base URL, e.g. http://192.168.1.50:8080 */
+static const app_cfg_field_t LOCAL_CFG[] = {
+    { .key = "url", .label = "Server URL", .type = ACFG_STR, .input = ACFG_PASTE, .max_len = LOCAL_URL_MAX - 1 },
+};
+TASKMASTER_REGISTER_APP_CONFIG(LOCAL_NS, "Local", LOCAL_CFG);
+
+/* ── the fetch job (runs on the worker, touches only its ctx) ── */
+typedef struct {
+    char   url[LOCAL_URL_MAX];
+    int    count;
+    bool   ok;
+    task_t items[TASK_MAX];
+} fetch_ctx_t;
+
+static esp_http_client_handle_t s_client;   /* live only during a fetch */
+static void fetch_abort(void *arg) { (void)arg; if (s_client) esp_http_client_close(s_client); }
+
+static void copy_field(char *dst, cJSON *obj, const char *key, size_t dst_sz)
 {
-    task_t *t = &s_view.items[i];
-    memset(t, 0, sizeof(*t));
-    strlcpy(t->id, id, sizeof(t->id));
-    strlcpy(t->parent_id, parent, sizeof(t->parent_id));
-    strlcpy(t->title, title, sizeof(t->title));
-    strlcpy(t->due, due, sizeof(t->due));
-    t->priority = prio;
+    cJSON *it = cJSON_GetObjectItem(obj, key);
+    if (cJSON_IsString(it) && it->valuestring) {
+        strlcpy(dst, it->valuestring, dst_sz);
+    }
 }
 
+static bool parse_tasks(const char *json, fetch_ctx_t *f)
+{
+    cJSON *root = cJSON_Parse(json);
+    if (!root) {
+        return false;
+    }
+    cJSON *arr = cJSON_GetObjectItem(root, "tasks");
+    int n = 0;
+    if (cJSON_IsArray(arr)) {
+        cJSON *it;
+        cJSON_ArrayForEach(it, arr) {
+            if (n >= TASK_MAX) break;
+            task_t *t = &f->items[n];
+            memset(t, 0, sizeof(*t));
+            copy_field(t->id,        it, "id",        sizeof(t->id));
+            copy_field(t->parent_id, it, "parent_id", sizeof(t->parent_id));
+            copy_field(t->title,     it, "title",     sizeof(t->title));
+            copy_field(t->due,       it, "due",       sizeof(t->due));
+            cJSON *p = cJSON_GetObjectItem(it, "priority");
+            t->priority = (cJSON_IsNumber(p)) ? (uint8_t)p->valueint : TASK_PRIO_MIN;
+            n++;
+        }
+    }
+    cJSON_Delete(root);
+    f->count = n;
+    return true;
+}
+
+static bool fetch_work(async_job_t *job, void *ctx)
+{
+    fetch_ctx_t *f = (fetch_ctx_t *)ctx;
+    f->count = 0;
+    f->ok = false;
+
+    char endpoint[LOCAL_URL_MAX + 8];
+    snprintf(endpoint, sizeof(endpoint), "%s/tasks", f->url);
+    esp_http_client_config_t cfg = { .url = endpoint, .timeout_ms = LOCAL_HTTP_TMO_MS };
+    s_client = esp_http_client_init(&cfg);
+    async_job_on_cancel(job, fetch_abort, NULL);
+
+    char *body = malloc(LOCAL_BODY_MAX);
+    if (body && esp_http_client_open(s_client, 0) == ESP_OK) {
+        esp_http_client_fetch_headers(s_client);
+        int total = 0, r;
+        while (total < LOCAL_BODY_MAX - 1 &&
+               (r = esp_http_client_read(s_client, body + total, LOCAL_BODY_MAX - 1 - total)) > 0) {
+            total += r;
+        }
+        body[total] = '\0';
+        if (!async_job_cancelled(job) && total > 0) {
+            f->ok = parse_tasks(body, f);
+        }
+        esp_http_client_close(s_client);
+    }
+    free(body);
+    esp_http_client_cleanup(s_client);
+    s_client = NULL;
+    ESP_LOGI(TAG, "fetch %s: ok=%d count=%d", endpoint, f->ok, f->count);
+    return f->ok;
+}
+
+static void fetch_done(void *ctx, bool ok)
+{
+    fetch_ctx_t *f = (fetch_ctx_t *)ctx;
+    s_syncing = false;
+    s_job = NULL;
+    if (ok) {
+        memcpy(s_view.items, f->items, (size_t)f->count * sizeof(task_t));
+        task_view_set_count(&s_view, f->count);
+        s_error = false;
+    } else {
+        s_error = true;
+    }
+}
+
+static void do_sync(void)
+{
+    if (s_url[0] == '\0' || !net_is_online() || s_syncing) {
+        return;
+    }
+    fetch_ctx_t f = {0};
+    strlcpy(f.url, s_url, sizeof(f.url));
+    s_job = async_job_submit(fetch_work, fetch_done, &f, sizeof(f));
+    s_syncing = (s_job != NULL);
+}
+
+/* ── app lifecycle ── */
 static void local_init(void)
 {
     task_view_init(&s_view, UI_ROWS);
-    seed_task(0, "1", "",  "Water the plants",       "today",    4);
-    seed_task(1, "4", "",  "Reply to the long email", "fri",      3);
-    seed_task(2, "2", "",  "Read a chapter",          "tomorrow", 2);
-    seed_task(3, "3", "2", "Find the bookmark",       "",         2);
-    task_view_set_count(&s_view, 4);
+    s_syncing = false;
+    s_error = false;
+    s_job = NULL;
+    app_store_open(&s_store, LOCAL_NS);
+    app_store_get_str(&s_store, "url", s_url, sizeof(s_url), "");
+    do_sync();
 }
 
 static void local_on_event(uint8_t ev)
 {
     switch (ev) {
-    case EV_ENCODER_CW:  task_view_move(&s_view, +1); break;
-    case EV_ENCODER_CCW: task_view_move(&s_view, -1); break;
-    /* Select = complete, click = detail menu — wired in step 10. */
+    case EV_ENCODER_CW:    task_view_move(&s_view, +1); break;
+    case EV_ENCODER_CCW:   task_view_move(&s_view, -1); break;
+    case EV_ENCODER_CLICK: do_sync(); break;             /* "Sync now" */
+    /* Select = complete the highlighted task — wired next. */
     default: break;
     }
 }
@@ -57,11 +177,34 @@ static void local_on_event(uint8_t ev)
 static void local_render(void)
 {
     lv_obj_clean(ui_frame_content());
-    ui_frame_set_hints(&LOCAL_HINTS);   /* size content (leave room for the bar) FIRST */
+    ui_frame_set_hints(&LOCAL_HINTS);
+
+    if (s_url[0] == '\0') {
+        ui_text_row(0, "Set URL in setup");
+        ui_text_row(1, "(Settings/Wi-Fi)");
+        return;
+    }
+    if (s_syncing && s_view.count == 0) {
+        ui_text_row(0, "Syncing...");
+        return;
+    }
+    if (s_error && s_view.count == 0) {
+        ui_text_row(0, "Sync failed");
+        ui_text_row(1, "click to retry");
+        return;
+    }
     task_view_render(&s_view);
 }
 
-static void local_exit(void) { }
+static void local_exit(void)
+{
+    /* Cancel an in-flight fetch (cooperative — aborts the socket, §6A). */
+    if (s_job) {
+        async_job_cancel(s_job);
+        s_job = NULL;
+    }
+    app_store_close(&s_store);
+}
 
 static const device_app_t local_app = {
     .name     = "Local",
