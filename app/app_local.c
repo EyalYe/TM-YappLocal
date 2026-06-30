@@ -151,6 +151,61 @@ static void do_sync(void)
     s_syncing = (s_job != NULL);
 }
 
+/* ── complete the highlighted task (POST /tasks/{id}/complete) ── */
+typedef struct {
+    char url[LOCAL_URL_MAX];
+    char id[TASK_ID_MAX];
+    bool ok;
+} post_ctx_t;
+
+static bool complete_work(async_job_t *job, void *ctx)
+{
+    post_ctx_t *p = (post_ctx_t *)ctx;
+    char endpoint[LOCAL_URL_MAX + TASK_ID_MAX + 24];
+    snprintf(endpoint, sizeof(endpoint), "%s/tasks/%s/complete", p->url, p->id);
+    esp_http_client_config_t cfg = {
+        .url = endpoint, .method = HTTP_METHOD_POST, .timeout_ms = LOCAL_HTTP_TMO_MS,
+    };
+    s_client = esp_http_client_init(&cfg);
+    async_job_on_cancel(job, fetch_abort, NULL);
+    esp_http_client_set_post_field(s_client, "", 0);
+    esp_err_t err = esp_http_client_perform(s_client);
+    int status = esp_http_client_get_status_code(s_client);
+    esp_http_client_cleanup(s_client);
+    s_client = NULL;
+    p->ok = (err == ESP_OK && status >= 200 && status < 300);
+    ESP_LOGI(TAG, "complete %s: ok=%d status=%d", endpoint, p->ok, status);
+    return p->ok;
+}
+
+static void complete_done(void *ctx, bool ok)
+{
+    (void)ctx; (void)ok;
+    s_syncing = false;
+    s_job = NULL;
+    do_sync();                 /* refresh from the server (confirms the removal) */
+}
+
+static void do_complete(void)
+{
+    int sel = task_view_sel(&s_view);
+    if (sel < 0 || sel >= s_view.count || s_syncing) {
+        return;
+    }
+    post_ctx_t p = {0};
+    strlcpy(p.url, s_url, sizeof(p.url));
+    strlcpy(p.id, s_view.items[sel].id, sizeof(p.id));
+    s_job = async_job_submit(complete_work, complete_done, &p, sizeof(p));
+    if (s_job) {
+        s_syncing = true;
+        /* Optimistic: drop the row now for a snappy ✓; the re-sync confirms. */
+        for (int i = sel; i < s_view.count - 1; i++) {
+            s_view.items[i] = s_view.items[i + 1];
+        }
+        task_view_set_count(&s_view, s_view.count - 1);
+    }
+}
+
 /* ── app lifecycle ── */
 static void local_init(void)
 {
@@ -160,12 +215,6 @@ static void local_init(void)
     s_job = NULL;
     app_store_open(&s_store, LOCAL_NS);
     app_store_get_str(&s_store, "url", s_url, sizeof(s_url), "");
-    /* TEMP (step-10 test): seed the test server URL once if unset. Remove later;
-     * the value persists in NVS, so re-provisioning isn't needed afterward. */
-    if (s_url[0] == '\0') {
-        strlcpy(s_url, "http://192.168.1.212:8080", sizeof(s_url));
-        app_store_set_str(&s_store, "url", s_url);
-    }
     do_sync();
 }
 
@@ -174,8 +223,8 @@ static void local_on_event(uint8_t ev)
     switch (ev) {
     case EV_ENCODER_CW:    task_view_move(&s_view, +1); break;
     case EV_ENCODER_CCW:   task_view_move(&s_view, -1); break;
-    case EV_ENCODER_CLICK: do_sync(); break;             /* "Sync now" */
-    /* Select = complete the highlighted task — wired next. */
+    case EV_ENCODER_CLICK: do_sync();     break;          /* "Sync now" */
+    case EV_SELECT:        do_complete(); break;          /* complete highlighted */
     default: break;
     }
 }
