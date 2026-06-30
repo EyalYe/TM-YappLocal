@@ -160,6 +160,12 @@ static void local_init(void)
     s_job = NULL;
     app_store_open(&s_store, LOCAL_NS);
     app_store_get_str(&s_store, "url", s_url, sizeof(s_url), "");
+    /* TEMP (step-10 test): seed the test server URL once if unset. Remove later;
+     * the value persists in NVS, so re-provisioning isn't needed afterward. */
+    if (s_url[0] == '\0') {
+        strlcpy(s_url, "http://192.168.1.212:8080", sizeof(s_url));
+        app_store_set_str(&s_store, "url", s_url);
+    }
     do_sync();
 }
 
