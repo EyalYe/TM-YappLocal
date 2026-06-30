@@ -57,8 +57,8 @@ static void local_on_event(uint8_t ev)
 static void local_render(void)
 {
     lv_obj_clean(ui_frame_content());
+    ui_frame_set_hints(&LOCAL_HINTS);   /* size content (leave room for the bar) FIRST */
     task_view_render(&s_view);
-    ui_frame_set_hints(&LOCAL_HINTS);
 }
 
 static void local_exit(void) { }
