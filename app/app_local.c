@@ -58,8 +58,11 @@ typedef struct {
     task_t items[TASK_MAX];
 } fetch_ctx_t;
 
-static esp_http_client_handle_t s_client;   /* live only during a fetch */
-static void fetch_abort(void *arg) { (void)arg; if (s_client) esp_http_client_close(s_client); }
+/* The HTTP client handle is worker-OWNED (a local in each *_work function), never a
+ * shared static: esp_http_client is not thread-safe, so the UI thread must never
+ * touch it. Cancel is cooperative — the worker polls async_job_cancelled() in its
+ * read loop and tears its own client down; exit() only sets the flag (§6A, step 13
+ * fix: the old cross-thread esp_http_client_close() abort crashed on Home-mid-fetch). */
 
 static void copy_field(char *dst, cJSON *obj, const char *key, size_t dst_sz)
 {
@@ -106,26 +109,26 @@ static bool fetch_work(async_job_t *job, void *ctx)
     char endpoint[LOCAL_URL_MAX + 8];
     snprintf(endpoint, sizeof(endpoint), "%s/tasks", f->url);
     esp_http_client_config_t cfg = { .url = endpoint, .timeout_ms = LOCAL_HTTP_TMO_MS };
-    s_client = esp_http_client_init(&cfg);
-    async_job_on_cancel(job, fetch_abort, NULL);
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
 
     char *body = malloc(LOCAL_BODY_MAX);
-    if (body && esp_http_client_open(s_client, 0) == ESP_OK) {
-        esp_http_client_fetch_headers(s_client);
+    if (body && esp_http_client_open(client, 0) == ESP_OK) {
+        esp_http_client_fetch_headers(client);
         int total = 0, r;
-        while (total < LOCAL_BODY_MAX - 1 &&
-               (r = esp_http_client_read(s_client, body + total, LOCAL_BODY_MAX - 1 - total)) > 0) {
+        /* Poll the cancel flag each iteration so Home mid-fetch bails cooperatively
+         * (no cross-thread client teardown — that crashed, step 13 fix). */
+        while (total < LOCAL_BODY_MAX - 1 && !async_job_cancelled(job) &&
+               (r = esp_http_client_read(client, body + total, LOCAL_BODY_MAX - 1 - total)) > 0) {
             total += r;
         }
         body[total] = '\0';
         if (!async_job_cancelled(job) && total > 0) {
             f->ok = parse_tasks(body, f);
         }
-        esp_http_client_close(s_client);
+        esp_http_client_close(client);
     }
     free(body);
-    esp_http_client_cleanup(s_client);
-    s_client = NULL;
+    esp_http_client_cleanup(client);
     ESP_LOGI(TAG, "fetch %s: ok=%d count=%d", endpoint, f->ok, f->count);
     return f->ok;
 }
@@ -164,19 +167,18 @@ typedef struct {
 
 static bool complete_work(async_job_t *job, void *ctx)
 {
+    (void)job;
     post_ctx_t *p = (post_ctx_t *)ctx;
     char endpoint[LOCAL_URL_MAX + TASK_ID_MAX + 24];
     snprintf(endpoint, sizeof(endpoint), "%s/tasks/%s/complete", p->url, p->id);
     esp_http_client_config_t cfg = {
         .url = endpoint, .method = HTTP_METHOD_POST, .timeout_ms = LOCAL_HTTP_TMO_MS,
     };
-    s_client = esp_http_client_init(&cfg);
-    async_job_on_cancel(job, fetch_abort, NULL);
-    esp_http_client_set_post_field(s_client, "", 0);
-    esp_err_t err = esp_http_client_perform(s_client);
-    int status = esp_http_client_get_status_code(s_client);
-    esp_http_client_cleanup(s_client);
-    s_client = NULL;
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_post_field(client, "", 0);
+    esp_err_t err = esp_http_client_perform(client);   /* bounded by timeout_ms */
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
     p->ok = (err == ESP_OK && status >= 200 && status < 300);
     ESP_LOGI(TAG, "complete %s: ok=%d status=%d", endpoint, p->ok, status);
     return p->ok;
